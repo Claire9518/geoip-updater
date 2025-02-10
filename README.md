@@ -107,7 +107,7 @@ docker run yourusername/geoip-updater:latest --action check
 #### 2. 执行一次性更新
 
 ```docker run --env-file .env yourusername/geoip-updater:latest --action update```
-#### 3. 检查当前状态
+#### 3. 启动定时更新服务
 ```docker run -d --env-file .env yourusername/geoip-updater:latest --action schedule```
 
 ### 日志查看
