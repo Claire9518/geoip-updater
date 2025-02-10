@@ -1,0 +1,20 @@
+version: '3'
+
+services:
+  geoip-updater:
+    build: .
+    image: geoip-updater:latest
+    env_file:
+      - .env
+    environment:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_PROFILE
+      - AWS_REGION
+      - LAMBDA_LAYER_NAME
+      - GEOIP_DOWNLOAD_URL
+      - CRON_SCHEDULE
+      - TZ
+    volumes:
+      - ./logs:/var/log:rw
+    restart: unless-stopped
