@@ -8,7 +8,6 @@ RUN apt-get update && \
     cron \
     curl \
     unzip \
-    python3-pip \
     groff \
     less \
     && rm -rf /var/lib/apt/lists/*
