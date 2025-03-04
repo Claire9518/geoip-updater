@@ -42,7 +42,7 @@ AWS_REGION=us-east-2
 LAMBDA_LAYER_NAME=GeoLite2
 
 # GeoIP Database Configuration
-GEOIP_DOWNLOAD_URL=https://ghp.ci/https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb
+GEOIP_DOWNLOAD_URL=https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb
 
 # Cron Configuration
 CRON_SCHEDULE=0 0 * * *
@@ -96,19 +96,19 @@ docker run -d \
 
 例如：
 ```
-docker run yourusername/geoip-updater:latest --action check
+docker run Claire9518/geoip-updater:latest --action check
 ```
 
 ### 使用示例
 
 #### 1. 检查当前状态
-```docker run --env-file .env yourusername/geoip-updater:latest --action check```
+```docker run --env-file .env Claire9518/geoip-updater:latest --action check```
 
 #### 2. 执行一次性更新
 
-```docker run --env-file .env yourusername/geoip-updater:latest --action update```
+```docker run --env-file .env Claire9518/geoip-updater:latest --action update```
 #### 3. 启动定时更新服务
-```docker run -d --env-file .env yourusername/geoip-updater:latest --action schedule```
+```docker run -d --env-file .env Claire9518/geoip-updater:latest --action schedule```
 
 ### 日志查看
 
