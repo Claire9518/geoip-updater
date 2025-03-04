@@ -64,7 +64,7 @@ docker run -d \
   --name geoip-updater \
   --restart unless-stopped \
   --env-file .env \
-  yourusername/geoip-updater:latest
+  Claire9518/geoip-updater:latest
 ```
 
 ### 配置说明
