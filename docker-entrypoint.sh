@@ -77,6 +77,7 @@ chmod 600 "${AWS_CONFIG_DIR}/config"
 chmod 644 /var/log/cron.log
 
 # 设置 cron 任务
+echo "PATH=/usr/local/bin:/usr/bin:/bin" > /etc/cron.d/geoip-updater
 echo "${CRON_SCHEDULE:-0 0 * * *} python /app/geoip_updater.py >> /var/log/cron.log 2>&1" > /etc/cron.d/geoip-updater
 chmod 0644 /etc/cron.d/geoip-updater
 crontab /etc/cron.d/geoip-updater
