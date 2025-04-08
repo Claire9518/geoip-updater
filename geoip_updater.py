@@ -6,6 +6,7 @@ import tempfile
 import zipfile
 import glob
 import shutil
+import fcntl
 from datetime import datetime
 import logging
 import schedule
@@ -33,6 +34,7 @@ class GeoIPUpdater:
         self.region = os.getenv('AWS_REGION', 'us-east-2')
         self.download_url = os.getenv('GEOIP_DOWNLOAD_URL', 
             'https://ghp.ci/https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb')
+        self.lock_file = '/tmp/geoip_updater.lock'
         
         # 初始化 AWS 客户端
         session = boto3.Session(profile_name=self.aws_profile)
@@ -231,6 +233,13 @@ class GeoIPUpdater:
                 logging.info("没有找到现有 Layer，需要更新")
                 return True
 
+            # 检查创建时间是否在过去5分钟内，如果是则跳过更新（防止频繁更新）
+            current_time = datetime.now().timestamp()
+            layer_time = layer_info['created_date'].timestamp() if isinstance(layer_info['created_date'], datetime) else layer_info['created_date']
+            if (current_time - layer_time) < 300:  # 5分钟 = 300秒
+                logging.info(f"最新层版本创建于{(current_time - layer_time):.1f}秒前，小于5分钟阈值，跳过更新")
+                return False
+
             # 下载现有的 Layer 版本进行比较
             try:
                 # 获取最新版本的详细信息
@@ -422,66 +431,109 @@ class GeoIPUpdater:
             
         except Exception as e:
             logging.error(f"清理未使用的层版本失败: {str(e)}")
-        
+
+    def acquire_lock(self):
+        """获取文件锁以确保只有一个进程在执行更新"""
+        try:
+            # 创建锁文件（如果不存在）
+            lock_fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR)
+            
+            # 尝试获取独占锁，非阻塞模式
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                logging.info("成功获取更新锁")
+                return lock_fd
+            except IOError:
+                # 如果锁已被其他进程持有
+                logging.info("另一个进程正在执行更新，跳过当前执行")
+                os.close(lock_fd)
+                return None
+        except Exception as e:
+            logging.error(f"获取锁失败: {str(e)}")
+            return None
+
+    def release_lock(self, lock_fd):
+        """释放文件锁"""
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+                logging.info("已释放更新锁")
+            except Exception as e:
+                logging.error(f"释放锁失败: {str(e)}")
+                
     def update_layer(self):
         """更新 Lambda Layer"""
         max_retries = 3
         retry_delay = 60  # 秒
+        lock_fd = None
         
-        for attempt in range(max_retries):
-            try:
-                self.cleanup_tmp_files(after_update=False)
-                # 下载数据库
-                mmdb_path = self.download_mmdb()
-                logging.info(f"成功下载数据库到: {mmdb_path}")
+        try:
+            # 尝试获取锁
+            lock_fd = self.acquire_lock()
+            if lock_fd is None:
+                return None  # 无法获取锁，返回
                 
-                # 检查是否需要更新
-                if not self.check_mmdb_update_needed(mmdb_path):
-                    logging.info("MMDB 文件无需更新")
+            # 执行常规清理
+            self.cleanup_tmp_files(after_update=False)
+            
+            for attempt in range(max_retries):
+                try:
+                    # 下载数据库
+                    mmdb_path = self.download_mmdb()
+                    logging.info(f"成功下载数据库到: {mmdb_path}")
+                    
+                    # 检查是否需要更新
+                    if not self.check_mmdb_update_needed(mmdb_path):
+                        logging.info("MMDB 文件无需更新")
+                        os.unlink(mmdb_path)
+                        return None
+                    
+                    file_size = os.path.getsize(mmdb_path)
+                    logging.info(f"下载的文件大小: {file_size} bytes")
+                    
+                    zip_content = self.create_layer_zip(mmdb_path)
+                    logging.info("成功创建 Layer ZIP 文件")
+                    
+                    response = self.lambda_client.publish_layer_version(
+                        LayerName=self.layer_name,
+                        Description=f'GeoIP database updated at {datetime.now().isoformat()}',
+                        Content={
+                            'ZipFile': zip_content
+                        },
+                        CompatibleRuntimes=['python3.8', 'python3.9', 'python3.10', 'python3.12'],
+                        CompatibleArchitectures=['x86_64', 'arm64']
+                    )
+                    
+                    new_version_arn = response['LayerVersionArn']
+                    logging.info(f"Layer 更新成功，新版本: {response['Version']}")
+                    
+                    # 更新使用该层的所有函数
+                    logging.info("开始更新使用该层的函数...")
+                    self.update_all_functions_using_layer(new_version_arn)
+                    
+                    # 清理临时文件
                     os.unlink(mmdb_path)
-                    return None
-                
-                file_size = os.path.getsize(mmdb_path)
-                logging.info(f"下载的文件大小: {file_size} bytes")
-                
-                zip_content = self.create_layer_zip(mmdb_path)
-                logging.info("成功创建 Layer ZIP 文件")
-                
-                response = self.lambda_client.publish_layer_version(
-                    LayerName=self.layer_name,
-                    Description=f'GeoIP database updated at {datetime.now().isoformat()}',
-                    Content={
-                        'ZipFile': zip_content
-                    },
-                    CompatibleRuntimes=['python3.8', 'python3.9', 'python3.10', 'python3.12'],
-                    CompatibleArchitectures=['x86_64', 'arm64']
-                )
-                
-                new_version_arn = response['LayerVersionArn']
-                logging.info(f"Layer 更新成功，新版本: {response['Version']}")
-                
-                # 更新使用该层的所有函数
-                logging.info("开始更新使用该层的函数...")
-                self.update_all_functions_using_layer(new_version_arn)
-                
-                # 清理临时文件
-                os.unlink(mmdb_path)
 
-                self.cleanup_tmp_files(after_update=True)
-                # 在成功更新后添加清理操作
-                logging.info("开始清理未使用的层版本...")
-                self.cleanup_unused_layer_versions(keep_latest_n=2)
-                return response['Version']
-                
-            except Exception as e:
-                logging.error(f"更新失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                if attempt < max_retries - 1:
-                    logging.info(f"等待 {retry_delay} 秒后重试...")
-                    time.sleep(retry_delay)
-                else:
-                    # 最后一次尝试也失败了，执行清理
                     self.cleanup_tmp_files(after_update=True)
-                    raise
+                    # 在成功更新后添加清理操作
+                    logging.info("开始清理未使用的层版本...")
+                    self.cleanup_unused_layer_versions(keep_latest_n=2)
+                    return response['Version']
+                    
+                except Exception as e:
+                    logging.error(f"更新失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        logging.info(f"等待 {retry_delay} 秒后重试...")
+                        time.sleep(retry_delay)
+                    else:
+                        # 最后一次尝试也失败了，执行清理
+                        self.cleanup_tmp_files(after_update=True)
+                        raise
+                        
+        finally:
+            # 确保释放锁
+            self.release_lock(lock_fd)
 
 def update_job():
     """定时任务"""
