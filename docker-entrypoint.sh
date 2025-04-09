@@ -76,14 +76,36 @@ chmod 600 "${AWS_CONFIG_DIR}/credentials"
 chmod 600 "${AWS_CONFIG_DIR}/config"
 chmod 644 /var/log/cron.log
 
-# 设置 cron 任务
-echo "PATH=/usr/local/bin:/usr/bin:/bin" > /etc/cron.d/geoip-updater
-echo "${CRON_SCHEDULE:-0 0 * * *} python /app/geoip_updater.py >> /var/log/cron.log 2>&1" > /etc/cron.d/geoip-updater
-chmod 0644 /etc/cron.d/geoip-updater
-crontab /etc/cron.d/geoip-updater
+# 处理 cron 任务 - 确保没有重复任务
+CRON_FILE="/etc/cron.d/geoip-updater"
 
-# 启动 cron
-service cron start
+# 清空或创建新的cron文件
+echo "# GeoIP Updater cron job" > "$CRON_FILE"
+echo "PATH=/usr/local/bin:/usr/bin:/bin" >> "$CRON_FILE"
+echo "${CRON_SCHEDULE:-0 0 * * *} /usr/local/bin/python /app/geoip_updater.py >> /var/log/cron.log 2>&1" >> "$CRON_FILE"
+echo "# End of cron file" >> "$CRON_FILE"
+
+echo "Debug: Cron file content:"
+cat "$CRON_FILE"
+
+# 设置cron文件权限
+chmod 0644 "$CRON_FILE"
+
+# 应用cron配置
+crontab "$CRON_FILE"
+
+# 检查crontab内容
+echo "Debug: Current crontab content:"
+crontab -l
+
+# 确保没有旧的重复任务
+# 重启cron服务以确保清除任何旧任务
+service cron restart
+
+echo "Cron service restarted and configuration applied."
+
+# 启动 cron - 确保cron服务正在运行
+service cron status || service cron start
 
 # 使用 tail -F
 exec tail -F /var/log/cron.log
