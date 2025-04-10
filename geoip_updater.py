@@ -233,13 +233,6 @@ class GeoIPUpdater:
                 logging.info("没有找到现有 Layer，需要更新")
                 return True
 
-            # 检查创建时间是否在过去5分钟内，如果是则跳过更新（防止频繁更新）
-            current_time = datetime.now().timestamp()
-            layer_time = layer_info['created_date'].timestamp() if isinstance(layer_info['created_date'], datetime) else layer_info['created_date']
-            if (current_time - layer_time) < 300:  # 5分钟 = 300秒
-                logging.info(f"最新层版本创建于{(current_time - layer_time):.1f}秒前，小于5分钟阈值，跳过更新")
-                return False
-
             # 下载现有的 Layer 版本进行比较
             try:
                 # 获取最新版本的详细信息
