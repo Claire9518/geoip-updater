@@ -18,8 +18,6 @@
 
 ```
 yaml
-version: '3'
-
 services:
   geoip-updater:
     image: yourusername/geoip-updater:latest
@@ -32,6 +30,15 @@ services:
 2. 创建 .env 文件：
 
 ```
+# Download method
+USE_MAXMIND_DIRECT=true
+
+# MaxMind configuration
+MAXMIND_ACCOUNT_ID=your_account_id
+MAXMIND_LICENSE_KEY=your_license_key
+MAXMIND_EDITION_ID=GeoLite2-City
+MAXMIND_SUFFIX=tar.gz
+
 # AWS Configuration
 AWS_ACCESS_KEY_ID=your_access_key_id
 AWS_SECRET_ACCESS_KEY=your_secret_key
@@ -71,16 +78,21 @@ docker run -d \
 
 #### 环境变量
 
-| 变量名                | 描述                 | 必需 | 默认值        |
-| --------------------- | -------------------- | ---- | ------------- |
-| AWS_ACCESS_KEY_ID     | AWS 访问密钥 ID      | 是   | -             |
-| AWS_SECRET_ACCESS_KEY | AWS 访问密钥         | 是   | -             |
-| AWS_PROFILE           | AWS 配置文件名称     | 否   | geoip-updater |
-| AWS_REGION            | AWS 区域             | 否   | us-east-2     |
-| LAMBDA_LAYER_NAME     | Lambda Layer 名称    | 否   | GeoLite2      |
-| GEOIP_DOWNLOAD_URL    | GeoIP 数据库下载地址 | 否   | (默认地址)    |
-| CRON_SCHEDULE         | Cron 更新计划        | 否   | 0 0 * * *     |
-| TZ                    | 时区                 | 否   | Asia/Shanghai |
+| 变量名                | 描述                    | 必需 | 默认值        |
+| --------------------- | ----------------------- | ---- | ------------- |
+| USE_MAXMIND_DIRECT    | 是否使用MaxMind进行下载 | 是   | false         |
+| MAXMIND_ACCOUNT_ID    | MaxMind 账户 ID         | 是   | -             |
+| MAXMIND_LICENSE_KEY   | MaxMind License Key     | 是   | -             |
+| MAXMIND_EDITION_ID    | 下载文件类别            | 是   | GeoLite2-City |
+| MAXMIND_SUFFIX        | 下载文件类型            | 是   | tar.gz        |
+| AWS_ACCESS_KEY_ID     | AWS 访问密钥 ID         | 是   | -             |
+| AWS_SECRET_ACCESS_KEY | AWS 访问密钥            | 是   | -             |
+| AWS_PROFILE           | AWS 配置文件名称        | 否   | geoip-updater |
+| AWS_REGION            | AWS 区域                | 否   | us-east-2     |
+| LAMBDA_LAYER_NAME     | Lambda Layer 名称       | 否   | GeoLite2      |
+| GEOIP_DOWNLOAD_URL    | GeoIP 数据库下载地址    | 否   | (默认地址)    |
+| CRON_SCHEDULE         | Cron 更新计划           | 否   | 0 0 * * *     |
+| TZ                    | 时区                    | 否   | Asia/Shanghai |
 
 #### 命令行参数
 
@@ -95,6 +107,7 @@ docker run -d \
   * `cleanup`: 清理临时文件
 
 例如：
+
 ```
 docker run Claire9518/geoip-updater:latest --action check
 ```
@@ -102,13 +115,16 @@ docker run Claire9518/geoip-updater:latest --action check
 ### 使用示例
 
 #### 1. 检查当前状态
-```docker run --env-file .env Claire9518/geoip-updater:latest --action check```
+
+``docker run --env-file .env Claire9518/geoip-updater:latest --action check``
 
 #### 2. 执行一次性更新
 
-```docker run --env-file .env Claire9518/geoip-updater:latest --action update```
+``docker run --env-file .env Claire9518/geoip-updater:latest --action update``
+
 #### 3. 启动定时更新服务
-```docker run -d --env-file .env Claire9518/geoip-updater:latest --action schedule```
+
+``docker run -d --env-file .env Claire9518/geoip-updater:latest --action schedule``
 
 ### 日志查看
 
