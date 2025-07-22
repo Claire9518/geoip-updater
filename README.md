@@ -88,6 +88,7 @@ docker run -d \
 | AWS_ACCESS_KEY_ID     | AWS 访问密钥 ID         | 是   | -             |
 | AWS_SECRET_ACCESS_KEY | AWS 访问密钥            | 是   | -             |
 | AWS_PROFILE           | AWS 配置文件名称        | 否   | geoip-updater |
+| PRIMARY_REGION        | AWS 主区域              | 否   | us-east-2     |
 | AWS_REGION            | AWS 区域                | 否   | us-east-2     |
 | LAMBDA_LAYER_NAME     | Lambda Layer 名称       | 否   | GeoLite2      |
 | GEOIP_DOWNLOAD_URL    | GeoIP 数据库下载地址    | 否   | (默认地址)    |
