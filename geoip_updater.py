@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import boto3
-import requests
 import os
 import tempfile
 import zipfile
@@ -9,15 +8,14 @@ import glob
 import shutil
 import fcntl
 import hashlib
-import json
 import time
 import sys
 import signal
+import subprocess
 from datetime import datetime
 import logging
 import schedule
 from dotenv import load_dotenv
-from requests.auth import HTTPBasicAuth
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -52,6 +50,11 @@ class GeoIPUpdater:
         self.maxmind_suffix = os.getenv('MAXMIND_SUFFIX', 'tar.gz')
         self.download_url = os.getenv('GEOIP_DOWNLOAD_URL', 
             'https://ghp.ci/https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb')
+        
+        # 网络配置
+        self.connection_timeout = int(os.getenv('CONNECTION_TIMEOUT', '15'))
+        self.max_time = int(os.getenv('MAX_DOWNLOAD_TIME', '60'))
+        self.retry_count = int(os.getenv('RETRY_COUNT', '3'))
         
         # 锁文件和状态
         self.lock_file = '/tmp/geoip_updater.lock'
@@ -215,6 +218,81 @@ class GeoIPUpdater:
                 else:
                     raise
 
+    def _build_curl_command(self, url, output_path, auth=None, extra_headers=None):
+        """构建curl命令"""
+        cmd = [
+            'curl',
+            '--location',
+            '--fail',
+            '--output', output_path,
+            '--connect-timeout', str(self.connection_timeout),
+            '--max-time', str(self.max_time),
+            '--retry', str(self.retry_count),
+            '--retry-delay', '2',
+            '--progress-bar',
+        ]
+        
+        # 添加认证
+        if auth:
+            cmd.extend(['--user', f'{auth[0]}:{auth[1]}'])
+        
+        # 添加额外头部
+        if extra_headers:
+            for header in extra_headers:
+                cmd.extend(['--header', header])
+        
+        cmd.append(url)
+        return cmd
+
+    def _execute_curl(self, cmd, description="下载"):
+        """执行curl命令并处理结果"""
+        # 隐藏认证信息和AWS URL的日志
+        safe_cmd = []
+        skip_next = False
+        for i, arg in enumerate(cmd):
+            if skip_next:
+                safe_cmd.append('[HIDDEN]')
+                skip_next = False
+            elif arg == '--user':
+                safe_cmd.append(arg)
+                skip_next = True
+            elif arg.startswith('https://') and ('amazonaws.com' in arg or 'awslambda' in arg):
+                safe_cmd.append('[AWS-URL-HIDDEN]')
+            else:
+                safe_cmd.append(arg)
+        
+        logging.info(f"执行{description}: {' '.join(safe_cmd)}")
+        
+        try:
+            start_time = time.time()
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.max_time + 30,
+                check=False
+            )
+            
+            elapsed_time = time.time() - start_time
+            
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else f"curl返回码: {result.returncode}"
+                raise subprocess.CalledProcessError(result.returncode, cmd, stderr=error_msg)
+            
+            logging.info(f"{description}完成，耗时: {elapsed_time:.2f}s")
+            return result
+            
+        except subprocess.TimeoutExpired:
+            logging.error(f"{description}超时 ({self.max_time + 30}s)")
+            raise
+        except subprocess.CalledProcessError as e:
+            logging.error(f"{description}失败: {e.stderr}")
+            raise
+        except Exception as e:
+            logging.error(f"{description}异常: {str(e)}")
+            raise
+
     def download_mmdb(self):
         """下载MMDB数据库（统一入口）"""
         if self.use_maxmind_direct:
@@ -231,46 +309,83 @@ class GeoIPUpdater:
             f"download?suffix={self.maxmind_suffix}"
         )
         
-        auth = HTTPBasicAuth(self.maxmind_account_id, self.maxmind_license_key)
-        headers = {'User-Agent': 'GeoIP-Updater/1.0', 'Accept': '*/*'}
-        
-        response = requests.get(maxmind_url, auth=auth, headers=headers, 
-                              timeout=60, allow_redirects=True, stream=True)
-        response.raise_for_status()
-        
-        # 保存文件
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"maxmind_{self.maxmind_edition_id}_{timestamp}.{self.maxmind_suffix}"
         downloaded_path = os.path.join('/tmp', filename)
         
-        with open(downloaded_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        
-        logging.info(f"MaxMind 文件已下载: {downloaded_path}")
-        
-        # 验证文件大小
-        if os.path.getsize(downloaded_path) < 1024:
-            raise ValueError("下载的文件太小")
-        
-        # 如果是tar.gz，需要解压
-        if self.maxmind_suffix == 'tar.gz':
-            return self._extract_mmdb_from_targz(downloaded_path)
-        return downloaded_path
+        try:
+            # 使用curl下载
+            cmd = self._build_curl_command(
+                url=maxmind_url,
+                output_path=downloaded_path,
+                auth=(self.maxmind_account_id, self.maxmind_license_key),
+                extra_headers=['User-Agent: GeoIP-Updater/1.0', 'Accept: */*']
+            )
+            
+            self._execute_curl(cmd, "MaxMind下载")
+            
+            # 验证下载结果
+            if not os.path.exists(downloaded_path):
+                raise FileNotFoundError(f"下载文件不存在: {downloaded_path}")
+            
+            file_size = os.path.getsize(downloaded_path)
+            if file_size < 1024:
+                os.unlink(downloaded_path)
+                raise ValueError(f"下载文件太小: {file_size} bytes")
+            
+            logging.info(f"MaxMind 文件已下载: {downloaded_path}")
+            
+            # 如果是tar.gz，需要解压
+            if self.maxmind_suffix == 'tar.gz':
+                return self._extract_mmdb_from_targz(downloaded_path)
+            return downloaded_path
+            
+        except Exception as e:
+            logging.error(f"MaxMind下载失败: {str(e)}")
+            if os.path.exists(downloaded_path):
+                try:
+                    os.unlink(downloaded_path)
+                except:
+                    pass
+            raise
 
     def _download_from_backup(self):
         """从备用URL下载"""
         logging.info(f"从备用URL下载: {self.download_url}")
         
-        response = requests.get(self.download_url, timeout=30)
-        response.raise_for_status()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"backup_{timestamp}.mmdb"
+        downloaded_path = os.path.join('/tmp', filename)
         
-        with tempfile.NamedTemporaryFile(suffix='.mmdb', delete=False) as tmp_file:
-            tmp_file.write(response.content)
-            tmp_path = tmp_file.name
-            logging.info(f"备用链接文件已下载: {tmp_path}")
-            return tmp_path
+        try:
+            # 使用curl下载
+            cmd = self._build_curl_command(
+                url=self.download_url,
+                output_path=downloaded_path
+            )
+            
+            self._execute_curl(cmd, "备用URL下载")
+            
+            # 验证文件
+            if not os.path.exists(downloaded_path):
+                raise FileNotFoundError(f"下载文件不存在: {downloaded_path}")
+            
+            file_size = os.path.getsize(downloaded_path)
+            if file_size < 1024:
+                os.unlink(downloaded_path)
+                raise ValueError(f"下载文件太小: {file_size} bytes")
+            
+            logging.info(f"备用链接文件已下载: {downloaded_path}")
+            return downloaded_path
+            
+        except Exception as e:
+            logging.error(f"备用URL下载失败: {str(e)}")
+            if os.path.exists(downloaded_path):
+                try:
+                    os.unlink(downloaded_path)
+                except:
+                    pass
+            raise
 
     def _extract_mmdb_from_targz(self, targz_path):
         """从tar.gz提取MMDB文件"""
@@ -392,16 +507,28 @@ class GeoIPUpdater:
     def _compare_layer_content(self, new_mmdb_path, download_url, region):
         """比较Layer内容"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            # 下载现有Layer
+            # 使用curl下载现有Layer
             current_layer_path = os.path.join(temp_dir, 'current_layer.zip')
-            response = requests.get(download_url)
-            with open(current_layer_path, 'wb') as f:
-                f.write(response.content)
+            
+            cmd = self._build_curl_command(
+                url=download_url,
+                output_path=current_layer_path
+            )
+            
+            try:
+                self._execute_curl(cmd, f"区域{region}现有Layer下载")
+            except Exception as e:
+                logging.warning(f"区域 {region} 下载现有Layer失败: {str(e)}，需要更新")
+                return True
             
             # 解压并找到MMDB文件
             current_mmdb_path = os.path.join(temp_dir, 'python/data/GeoLite2-City.mmdb')
-            with zipfile.ZipFile(current_layer_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
+            try:
+                with zipfile.ZipFile(current_layer_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+            except Exception as e:
+                logging.warning(f"区域 {region} 解压现有Layer失败: {str(e)}，需要更新")
+                return True
             
             if not os.path.exists(current_mmdb_path):
                 logging.warning(f"区域 {region} 现有Layer中未找到MMDB文件，需要更新")
@@ -553,7 +680,8 @@ class GeoIPUpdater:
         patterns = [
             ('/tmp/*.mmdb', 'MMDB文件'),
             ('/tmp/*.tar.gz', 'tar.gz文件'),
-            ('/tmp/maxmind_*', 'MaxMind文件')
+            ('/tmp/maxmind_*', 'MaxMind文件'),
+            ('/tmp/backup_*', '备用文件')
         ]
         
         for pattern, file_type in patterns:
@@ -755,6 +883,9 @@ def main():
                        help='清理模式')
     
     args = parser.parse_args()
+
+    if args.action == 'update':
+        logging.info("开始执行GeoIP数据库更新...")
     
     try:
         updater = GeoIPUpdater()
