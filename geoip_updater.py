@@ -154,7 +154,8 @@ class GeoIPUpdater:
             try:
                 yield
             finally:
-                pass  # 锁的释放由特定条件控制，不在这里自动释放
+                # 确保锁总是被释放
+                self._release_lock()
         else:
             raise RuntimeError("无法获取更新锁，另一个进程可能正在运行")
 
@@ -782,9 +783,6 @@ class GeoIPUpdater:
 
     def update_layer(self, force_update=False):
         """主更新方法"""
-        should_release_lock = False
-        download_failed_count = 0
-        
         try:
             with self.file_lock():
                 # 清理旧文件
@@ -805,21 +803,10 @@ class GeoIPUpdater:
                         # 清理下载的文件
                         os.unlink(mmdb_path)
                         self.cleanup_temp_files(after_update=True)
-                        
-                        should_release_lock = True  # 正常完成，应该释放锁
                         return results
                     
                     # 执行更新
                     results = self.update_all_regions(mmdb_path)
-                    
-                    # 检查更新结果
-                    success_count = sum(1 for r in results.values() if r['status'] == 'success')
-                    if success_count > 0:
-                        logging.info(f"有 {success_count} 个区域更新成功")
-                        should_release_lock = True  # 有成功更新，释放锁
-                    else:
-                        logging.warning("所有区域更新都失败了，保持锁定状态")
-                        should_release_lock = False  # 全部失败，不释放锁
                     
                     # 清理临时文件
                     os.unlink(mmdb_path)
@@ -828,32 +815,16 @@ class GeoIPUpdater:
                     return results
                     
                 except Exception as e:
-                    download_failed_count += 1
-                    logging.error(f"下载或更新过程失败 (第{download_failed_count}次): {str(e)}")
+                    logging.error(f"下载或更新过程失败: {str(e)}")
                     self.cleanup_temp_files(after_update=True)
-                    
-                    # 如果是多次下载失败，标记需要释放锁
-                    if download_failed_count >= 3:  # 假设重试3次后认为是多次失败
-                        should_release_lock = True
-                        logging.error("多次下载失败，将释放锁")
-                    
                     raise
                     
         except KeyboardInterrupt:
-            logging.info("检测到手动中断，将释放锁")
-            should_release_lock = True
+            logging.info("检测到手动中断，程序退出")
             raise
         except Exception as e:
-            if should_release_lock:
-                logging.error("操作失败但需要释放锁")
+            logging.error(f"更新操作失败: {str(e)}")
             raise
-        finally:
-            # 根据条件决定是否释放锁
-            if should_release_lock:
-                logging.info("释放更新锁")
-                self._release_lock()
-            else:
-                logging.info("保持锁定状态，等待下次操作")
 
 def update_job():
     """定时任务执行函数"""
