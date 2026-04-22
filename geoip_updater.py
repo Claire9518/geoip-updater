@@ -477,89 +477,68 @@ class GeoIPUpdater:
             return None
 
     def check_update_needed(self, mmdb_path, region=None):
-        """检查是否需要更新"""
+        """检查是否需要更新 - 优先通过 Description 中的 hash 比较，避免下载整个 Layer"""
         region = region or self.primary_region
         layer_info = self.get_layer_info(region)
-        
+
         if not layer_info:
             logging.info(f"区域 {region} 没有现有Layer，需要更新")
             return True
-        
+
         try:
-            # 获取现有Layer的详细信息
             response = self.execute_lambda_operation(
                 'get_layer_version', region,
                 LayerName=self.layer_name,
                 VersionNumber=layer_info['version']
             )
-            
-            download_url = response.get('Content', {}).get('Location')
-            if not download_url:
-                logging.warning(f"区域 {region} 无法获取Layer下载URL，需要更新")
-                return True
-            
-            # 下载并比较现有Layer
-            return self._compare_layer_content(mmdb_path, download_url, region)
-            
-        except Exception as e:
-            logging.warning(f"区域 {region} 比较Layer失败: {str(e)}")
+
+            description = response.get('Description', '')
+            new_hash = self.get_file_hash(mmdb_path)
+
+            # ✅ 优先路径：从 Description 提取 hash，无需下载 Layer
+            if 'mmdb_hash:' in description:
+                existing_hash = description.split('mmdb_hash:')[1].split('|')[0].strip()
+                if existing_hash == new_hash:
+                    logging.info(
+                        f"区域 {region} MMDB hash 相同 "
+                        f"({new_hash[:8]}...)，无需更新"
+                    )
+                    return False
+                else:
+                    logging.info(
+                        f"区域 {region} MMDB hash 变化 "
+                        f"{existing_hash[:8]}... → {new_hash[:8]}...，需要更新"
+                    )
+                    return True
+
+            # ⚠️ 降级路径：旧版本 Layer Description 中无 hash（仅首次迁移时触发）
+            # 直接判定为需要更新，跳过下载比较，避免超时
+            logging.info(
+                f"区域 {region} Layer Description 中无 hash 信息（旧版本），"
+                f"直接执行更新以写入 hash"
+            )
             return True
 
-    def _compare_layer_content(self, new_mmdb_path, download_url, region):
-        """比较Layer内容"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # 使用curl下载现有Layer
-            current_layer_path = os.path.join(temp_dir, 'current_layer.zip')
-            
-            cmd = self._build_curl_command(
-                url=download_url,
-                output_path=current_layer_path
-            )
-            
-            try:
-                self._execute_curl(cmd, f"区域{region}现有Layer下载")
-            except Exception as e:
-                logging.warning(f"区域 {region} 下载现有Layer失败: {str(e)}，需要更新")
-                return True
-            
-            # 解压并找到MMDB文件
-            current_mmdb_path = os.path.join(temp_dir, 'python/data/GeoLite2-City.mmdb')
-            try:
-                with zipfile.ZipFile(current_layer_path, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir)
-            except Exception as e:
-                logging.warning(f"区域 {region} 解压现有Layer失败: {str(e)}，需要更新")
-                return True
-            
-            if not os.path.exists(current_mmdb_path):
-                logging.warning(f"区域 {region} 现有Layer中未找到MMDB文件，需要更新")
-                return True
-            
-            # 比较文件哈希
-            new_hash = self.get_file_hash(new_mmdb_path)
-            current_hash = self.get_file_hash(current_mmdb_path)
-            
-            if new_hash != current_hash:
-                new_size = os.path.getsize(new_mmdb_path)
-                current_size = os.path.getsize(current_mmdb_path)
-                logging.info(f"区域 {region} 文件内容有变化，大小差异: {abs(new_size - current_size)} bytes")
-                return True
-            
-            logging.info(f"区域 {region} 文件内容相同，无需更新")
-            return False
+        except Exception as e:
+            logging.warning(f"区域 {region} 检查更新失败: {str(e)}，执行更新")
+            return True
 
-    def update_layer_version(self, zip_content, region):
+    def update_layer_version(self, zip_content, region, mmdb_hash=None):
         """更新单个区域的Layer版本"""
         try:
+            description = f'GeoIP updated at {datetime.now().isoformat()} for {region}'
+            if mmdb_hash:
+                description += f' | mmdb_hash:{mmdb_hash}'  # 写入 hash
+
             response = self.execute_lambda_operation(
                 'publish_layer_version', region,
                 LayerName=self.layer_name,
-                Description=f'GeoIP database updated at {datetime.now().isoformat()} for {region}',
+                Description=description,
                 Content={'ZipFile': zip_content},
                 CompatibleRuntimes=['python3.8', 'python3.9', 'python3.10', 'python3.12'],
                 CompatibleArchitectures=['x86_64', 'arm64']
             )
-            
+
             logging.info(f"区域 {region} Layer更新成功，版本: {response['Version']}")
             return {
                 'status': 'success',
@@ -722,15 +701,17 @@ class GeoIPUpdater:
     def update_all_regions(self, mmdb_path):
         """更新所有区域"""
         zip_content = self.create_layer_zip(mmdb_path)
+        mmdb_hash = self.get_file_hash(mmdb_path)  # 计算一次，所有区域共用
         results = {}
-        
-        # 使用线程池并行更新
+
         with ThreadPoolExecutor(max_workers=min(len(self.regions), 5)) as executor:
             future_to_region = {
-                executor.submit(self._update_single_region, region, zip_content): region
+                executor.submit(
+                    self._update_single_region, region, zip_content, mmdb_hash
+                ): region
                 for region in self.regions
             }
-            
+
             for future in as_completed(future_to_region):
                 region = future_to_region[future]
                 try:
@@ -738,27 +719,23 @@ class GeoIPUpdater:
                 except Exception as e:
                     logging.error(f"区域 {region} 更新异常: {str(e)}")
                     results[region] = {'status': 'failed', 'error': str(e)}
-        
+
         self._log_update_results(results)
         return results
 
-    def _update_single_region(self, region, zip_content):
+    def _update_single_region(self, region, zip_content, mmdb_hash=None):
         """更新单个区域的完整流程"""
         try:
-            # 更新Layer版本
-            layer_result = self.update_layer_version(zip_content, region)
+            layer_result = self.update_layer_version(zip_content, region, mmdb_hash)
             if layer_result['status'] != 'success':
                 return layer_result
-            
-            # 更新函数
+
             updated_functions = self.update_functions_using_layer(layer_result['arn'], region)
-            
-            # 清理旧版本
             self.cleanup_old_layer_versions(region)
-            
+
             layer_result['updated_functions'] = len(updated_functions)
             return layer_result
-            
+
         except Exception as e:
             logging.error(f"区域 {region} 更新失败: {str(e)}")
             return {'status': 'failed', 'error': str(e)}
