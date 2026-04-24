@@ -20,13 +20,23 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 加载 .env 文件
-load_dotenv(override=True)
+# 优先从当前目录或 /app 目录加载
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+load_dotenv(env_path, override=True)
 
 # 配置日志
+log_file = os.getenv('LOG_FILE', 'geoip_updater.log')
+# 如果是在 Docker 中运行且没有指定绝对路径，默认放到 /var/log
+if os.path.exists('/.dockerenv') and not os.path.isabs(log_file):
+    log_file = os.path.join('/var/log', log_file)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    filename='geoip_updater.log'
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 
 class GeoIPUpdater:

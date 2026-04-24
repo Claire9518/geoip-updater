@@ -76,13 +76,17 @@ chmod 600 "${AWS_CONFIG_DIR}/credentials"
 chmod 600 "${AWS_CONFIG_DIR}/config"
 chmod 644 /var/log/cron.log
 
+# 保存环境变量供 cron 使用
+printenv | grep -v "no_proxy" > /etc/environment
+
 # 处理 cron 任务 - 确保没有重复任务
 CRON_FILE="/etc/cron.d/geoip-updater"
 
 # 清空或创建新的cron文件
 echo "# GeoIP Updater cron job" > "$CRON_FILE"
 echo "PATH=/usr/local/bin:/usr/bin:/bin" >> "$CRON_FILE"
-echo "${CRON_SCHEDULE:-0 0 * * *} /usr/local/bin/python /app/geoip_updater.py >> /var/log/cron.log 2>&1" >> "$CRON_FILE"
+# 确保在 /app 目录下运行，以便正确读取 .env 和相关文件
+echo "${CRON_SCHEDULE:-0 0 * * *} cd /app && /usr/local/bin/python geoip_updater.py >> /var/log/cron.log 2>&1" >> "$CRON_FILE"
 echo "# End of cron file" >> "$CRON_FILE"
 
 echo "Debug: Cron file content:"
