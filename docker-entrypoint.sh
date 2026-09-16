@@ -23,17 +23,17 @@ if [ -f /app/.env ]; then
     done < /app/.env
 fi
 
-# 打印所有环境变量
-echo "Debug: All environment variables:"
-env
+# 打印非敏感环境变量（过滤密钥）
+echo "Debug: Non-sensitive environment variables:"
+env | grep -vE '(SECRET|KEY|PASSWORD|TOKEN|CREDENTIAL)'
 
 AWS_CONFIG_DIR=~/.aws
 export AWS_CONFIG_DIR
 
-# 打印环境变量，验证是否正确传入
+# 打印环境变量（不显示密钥），验证是否正确传入
 echo "Debug: Environment variables"
-echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:0:4}****"
+echo "AWS_SECRET_ACCESS_KEY=****"
 echo "AWS_PROFILE=${AWS_PROFILE}"
 echo "AWS_REGION=${AWS_REGION}"
 
@@ -65,9 +65,9 @@ region=${AWS_REGION:-us-east-2}
 output=json
 EOF
 
-# 验证文件内容
-echo "Debug: Checking credentials file content"
-cat "${AWS_CONFIG_DIR}/credentials"
+# 验证文件内容（不打印密钥）
+echo "Debug: Checking credentials file exists"
+ls -la "${AWS_CONFIG_DIR}/credentials"
 echo "Debug: Checking config file content"
 cat "${AWS_CONFIG_DIR}/config"
 

@@ -8,12 +8,14 @@ import glob
 import shutil
 import fcntl
 import hashlib
+import re
 import time
 import sys
 import signal
 import subprocess
 from datetime import datetime
 import logging
+import logging.handlers
 import schedule
 from dotenv import load_dotenv
 from contextlib import contextmanager
@@ -30,11 +32,16 @@ log_file = os.getenv('LOG_FILE', 'geoip_updater.log')
 if os.path.exists('/.dockerenv') and not os.path.isabs(log_file):
     log_file = os.path.join('/var/log', log_file)
 
+log_max_bytes = int(os.getenv('LOG_MAX_BYTES', str(10 * 1024 * 1024)))
+log_backup_count = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file),
+        logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=log_max_bytes, backupCount=log_backup_count
+        ),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -61,6 +68,13 @@ class GeoIPUpdater:
         self.download_url = os.getenv('GEOIP_DOWNLOAD_URL', 
             'https://ghp.ci/https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb')
         
+        # ASN 配置
+        self.asn_enabled = os.getenv('ASN_ENABLED', 'false').lower() == 'true'
+        self.asn_maxmind_edition_id = os.getenv('ASN_MAXMIND_EDITION_ID', 'GeoLite2-ASN')
+        self.asn_maxmind_suffix = os.getenv('ASN_MAXMIND_SUFFIX', 'tar.gz')
+        self.asn_download_url = os.getenv('ASN_DOWNLOAD_URL', '')
+        self.hash_compare_mode = os.getenv('HASH_COMPARE_MODE', 'both').lower()
+        
         # 网络配置
         self.connection_timeout = int(os.getenv('CONNECTION_TIMEOUT', '15'))
         self.max_time = int(os.getenv('MAX_DOWNLOAD_TIME', '60'))
@@ -80,6 +94,7 @@ class GeoIPUpdater:
         
         logging.info(f"初始化完成 - 主区域: {self.primary_region}, 所有区域: {', '.join(self.regions)}")
         logging.info(f"下载配置: {'MaxMind官方' if self.use_maxmind_direct else '备用链接'}")
+        logging.info(f"ASN: {'启用' if self.asn_enabled else '禁用'}, Hash比较模式: {self.hash_compare_mode}")
 
     def _init_aws_clients(self):
         """初始化AWS客户端"""
@@ -138,6 +153,16 @@ class GeoIPUpdater:
             raise EnvironmentError(f"缺少必要的环境变量: {', '.join(missing_vars)}")
         
         logging.info(f"环境变量验证通过，操作: {action}")
+        
+        # ASN 配置警告
+        if self.asn_enabled and not self.use_maxmind_direct and not self.asn_download_url:
+            logging.warning("ASN 已启用但未配置 ASN_DOWNLOAD_URL 且未使用 MaxMind 直连，ASN 下载将失败")
+        
+        # hash_compare_mode 验证
+        valid_modes = ('city', 'asn', 'both', 'none')
+        if self.hash_compare_mode not in valid_modes:
+            logging.warning(f"无效的 HASH_COMPARE_MODE '{self.hash_compare_mode}'，默认使用 'both'")
+            self.hash_compare_mode = 'both'
         
         # 测试AWS权限
         if action in ['update', 'schedule']:
@@ -311,17 +336,38 @@ class GeoIPUpdater:
         else:
             return self.execute_with_retry(self._download_from_backup, max_retries=3)
 
-    def _download_from_maxmind(self):
+    def download_asn_mmdb(self):
+        """下载ASN MMDB数据库"""
+        if self.use_maxmind_direct:
+            return self.execute_with_retry(
+                self._download_from_maxmind, max_retries=5,
+                edition_id=self.asn_maxmind_edition_id,
+                suffix=self.asn_maxmind_suffix
+            )
+        else:
+            if not self.asn_download_url:
+                raise EnvironmentError(
+                    "ASN 启用但未配置 ASN_DOWNLOAD_URL 且未使用 MaxMind 直接下载"
+                )
+            return self.execute_with_retry(
+                self._download_from_backup, max_retries=3,
+                download_url=self.asn_download_url,
+                name_prefix='asn'
+            )
+
+    def _download_from_maxmind(self, edition_id=None, suffix=None):
         """从MaxMind官方下载"""
-        logging.info(f"从 MaxMind 官方下载 {self.maxmind_edition_id}")
+        edition_id = edition_id or self.maxmind_edition_id
+        suffix = suffix or self.maxmind_suffix
+        logging.info(f"从 MaxMind 官方下载 {edition_id}")
         
         maxmind_url = (
-            f"https://download.maxmind.com/geoip/databases/{self.maxmind_edition_id}/"
-            f"download?suffix={self.maxmind_suffix}"
+            f"https://download.maxmind.com/geoip/databases/{edition_id}/"
+            f"download?suffix={suffix}"
         )
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"maxmind_{self.maxmind_edition_id}_{timestamp}.{self.maxmind_suffix}"
+        filename = f"maxmind_{edition_id}_{timestamp}.{suffix}"
         downloaded_path = os.path.join('/tmp', filename)
         
         try:
@@ -347,8 +393,8 @@ class GeoIPUpdater:
             logging.info(f"MaxMind 文件已下载: {downloaded_path}")
             
             # 如果是tar.gz，需要解压
-            if self.maxmind_suffix == 'tar.gz':
-                return self._extract_mmdb_from_targz(downloaded_path)
+            if suffix == 'tar.gz':
+                return self._extract_mmdb_from_targz(downloaded_path, edition_id)
             return downloaded_path
             
         except Exception as e:
@@ -356,22 +402,23 @@ class GeoIPUpdater:
             if os.path.exists(downloaded_path):
                 try:
                     os.unlink(downloaded_path)
-                except:
+                except Exception:
                     pass
             raise
 
-    def _download_from_backup(self):
+    def _download_from_backup(self, download_url=None, name_prefix='backup'):
         """从备用URL下载"""
-        logging.info(f"从备用URL下载: {self.download_url}")
+        download_url = download_url or self.download_url
+        logging.info(f"从备用URL下载: {download_url}")
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"backup_{timestamp}.mmdb"
+        filename = f"{name_prefix}_{timestamp}.mmdb"
         downloaded_path = os.path.join('/tmp', filename)
         
         try:
             # 使用curl下载
             cmd = self._build_curl_command(
-                url=self.download_url,
+                url=download_url,
                 output_path=downloaded_path
             )
             
@@ -394,12 +441,13 @@ class GeoIPUpdater:
             if os.path.exists(downloaded_path):
                 try:
                     os.unlink(downloaded_path)
-                except:
+                except Exception:
                     pass
             raise
 
-    def _extract_mmdb_from_targz(self, targz_path):
+    def _extract_mmdb_from_targz(self, targz_path, edition_id=None):
         """从tar.gz提取MMDB文件"""
+        edition_id = edition_id or self.maxmind_edition_id
         logging.info(f"解压 tar.gz 文件: {targz_path}")
         
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -419,7 +467,7 @@ class GeoIPUpdater:
             # 选择匹配的文件或第一个
             source_mmdb = mmdb_files[0]
             for mmdb_file in mmdb_files:
-                if self.maxmind_edition_id in os.path.basename(mmdb_file):
+                if edition_id in os.path.basename(mmdb_file):
                     source_mmdb = mmdb_file
                     break
             
@@ -435,7 +483,7 @@ class GeoIPUpdater:
             logging.info(f"MMDB文件已提取: {extracted_path}")
             return extracted_path
 
-    def create_layer_zip(self, mmdb_path):
+    def create_layer_zip(self, mmdb_path, asn_mmdb_path=None):
         """创建Layer ZIP文件"""
         logging.info("创建 Layer ZIP 文件")
         
@@ -447,6 +495,10 @@ class GeoIPUpdater:
             # 复制MMDB文件
             dest_file = os.path.join(layer_dir, 'GeoLite2-City.mmdb')
             shutil.copy2(mmdb_path, dest_file)
+            
+            if asn_mmdb_path:
+                asn_dest = os.path.join(layer_dir, 'GeoLite2-ASN.mmdb')
+                shutil.copy2(asn_mmdb_path, asn_dest)
             
             # 创建ZIP
             zip_path = os.path.join(temp_dir, 'layer.zip')
@@ -486,13 +538,29 @@ class GeoIPUpdater:
             logging.warning(f"区域 {region} 获取Layer信息失败: {str(e)}")
             return None
 
-    def check_update_needed(self, mmdb_path, region=None):
-        """检查是否需要更新 - 优先通过 Description 中的 hash 比较，避免下载整个 Layer"""
+    @staticmethod
+    def _extract_hash(description, key):
+        """从 Description 中提取指定 key 的短 hash 前缀
+
+        仅匹配位于行首或空白后的 `<key>:` 标记，避免误匹配 Description
+        中其他位置出现的同名子串。
+        """
+        match = re.search(rf'(?:^|\s){re.escape(key)}:(\S+)', description)
+        if match:
+            return match.group(1).strip()
+        return ''
+
+    def check_update_needed(self, mmdb_path, asn_mmdb_path=None, region=None):
+        """检查是否需要更新 - 通过 Description 中的 hash 比较"""
         region = region or self.primary_region
         layer_info = self.get_layer_info(region)
 
         if not layer_info:
             logging.info(f"区域 {region} 没有现有Layer，需要更新")
+            return True
+
+        if self.hash_compare_mode == 'none':
+            logging.info(f"区域 {region} HASH_COMPARE_MODE=none，始终更新")
             return True
 
         try:
@@ -503,42 +571,66 @@ class GeoIPUpdater:
             )
 
             description = response.get('Description', '')
-            new_hash = self.get_file_hash(mmdb_path)
 
-            # ✅ 优先路径：从 Description 提取 hash，无需下载 Layer
-            if 'mmdb_hash:' in description:
-                existing_hash = description.split('mmdb_hash:')[1].split('|')[0].strip()
-                if existing_hash == new_hash:
-                    logging.info(
-                        f"区域 {region} MMDB hash 相同 "
-                        f"({new_hash[:8]}...)，无需更新"
-                    )
-                    return False
-                else:
-                    logging.info(
-                        f"区域 {region} MMDB hash 变化 "
-                        f"{existing_hash[:8]}... → {new_hash[:8]}...，需要更新"
-                    )
-                    return True
+            # 从 Description 提取现有 hash（兼容新旧格式）
+            existing_city_hash = self._extract_hash(description, 'c')
+            existing_asn_hash = self._extract_hash(description, 'a')
 
-            # ⚠️ 降级路径：旧版本 Layer Description 中无 hash（仅首次迁移时触发）
-            # 直接判定为需要更新，跳过下载比较，避免超时
-            logging.info(
-                f"区域 {region} Layer Description 中无 hash 信息（旧版本），"
-                f"直接执行更新以写入 hash"
-            )
-            return True
+            # 兼容旧格式 mmdb_hash:<32-char>
+            if not existing_city_hash and 'mmdb_hash:' in description:
+                old_hash = description.split('mmdb_hash:')[1].split('|')[0].split()[0].strip()
+                existing_city_hash = old_hash[:8]
+
+            # 计算新 hash 前缀
+            new_city_hash = self.get_file_hash(mmdb_path)[:8]
+            new_asn_hash = self.get_file_hash(asn_mmdb_path)[:8] if asn_mmdb_path else ''
+
+            # ASN 开关切换检测（无论 mode 始终触发更新）
+            if existing_asn_hash and not new_asn_hash:
+                logging.info(f"区域 {region} ASN 已关闭，需要更新（移除 ASN）")
+                return True
+            if not existing_asn_hash and new_asn_hash:
+                logging.info(f"区域 {region} ASN 已开启，需要更新（添加 ASN）")
+                return True
+
+            # 按 hash_compare_mode 比较
+            need_update = False
+            if self.hash_compare_mode in ('city', 'both'):
+                if existing_city_hash != new_city_hash:
+                    logging.info(
+                        f"区域 {region} City hash 变化 "
+                        f"{existing_city_hash} → {new_city_hash}，需要更新"
+                    )
+                    need_update = True
+
+            if self.hash_compare_mode in ('asn', 'both'):
+                if existing_asn_hash != new_asn_hash:
+                    logging.info(
+                        f"区域 {region} ASN hash 变化 "
+                        f"{existing_asn_hash} → {new_asn_hash}，需要更新"
+                    )
+                    need_update = True
+
+            if not need_update:
+                logging.info(
+                    f"区域 {region} hash 无变化 "
+                    f"(c:{new_city_hash} a:{new_asn_hash or 'N/A'})，无需更新"
+                )
+
+            return need_update
 
         except Exception as e:
             logging.warning(f"区域 {region} 检查更新失败: {str(e)}，执行更新")
             return True
 
-    def update_layer_version(self, zip_content, region, mmdb_hash=None):
+    def update_layer_version(self, zip_content, region, city_hash=None, asn_hash=None):
         """更新单个区域的Layer版本"""
         try:
-            description = f'GeoIP updated at {datetime.now().isoformat()} for {region}'
-            if mmdb_hash:
-                description += f' | mmdb_hash:{mmdb_hash}'  # 写入 hash
+            description = f'v{datetime.now().strftime("%Y%m%dT%H:%M:%S")}'
+            if city_hash:
+                description += f' c:{city_hash[:8]}'
+            if asn_hash:
+                description += f' a:{asn_hash[:8]}'
 
             response = self.execute_lambda_operation(
                 'publish_layer_version', region,
@@ -671,7 +763,10 @@ class GeoIPUpdater:
             ('/tmp/*.mmdb', 'MMDB文件'),
             ('/tmp/*.tar.gz', 'tar.gz文件'),
             ('/tmp/maxmind_*', 'MaxMind文件'),
-            ('/tmp/backup_*', '备用文件')
+            ('/tmp/backup_*', '备用文件'),
+            ('/tmp/asn_*', 'ASN文件'),
+            ('/tmp/*_GeoLite2-ASN_*', 'ASN MaxMind文件'),
+            ('/tmp/*_GeoLite2-ASN-*', 'ASN备用文件')
         ]
         
         for pattern, file_type in patterns:
@@ -708,16 +803,17 @@ class GeoIPUpdater:
                 except Exception as e:
                     logging.warning(f"删除目录 {dir_path} 失败: {str(e)}")
 
-    def update_all_regions(self, mmdb_path):
+    def update_all_regions(self, mmdb_path, asn_mmdb_path=None):
         """更新所有区域"""
-        zip_content = self.create_layer_zip(mmdb_path)
-        mmdb_hash = self.get_file_hash(mmdb_path)  # 计算一次，所有区域共用
+        zip_content = self.create_layer_zip(mmdb_path, asn_mmdb_path)
+        city_hash = self.get_file_hash(mmdb_path)
+        asn_hash = self.get_file_hash(asn_mmdb_path) if asn_mmdb_path else None
         results = {}
 
         with ThreadPoolExecutor(max_workers=min(len(self.regions), 5)) as executor:
             future_to_region = {
                 executor.submit(
-                    self._update_single_region, region, zip_content, mmdb_hash
+                    self._update_single_region, region, zip_content, city_hash, asn_hash
                 ): region
                 for region in self.regions
             }
@@ -733,10 +829,10 @@ class GeoIPUpdater:
         self._log_update_results(results)
         return results
 
-    def _update_single_region(self, region, zip_content, mmdb_hash=None):
+    def _update_single_region(self, region, zip_content, city_hash=None, asn_hash=None):
         """更新单个区域的完整流程"""
         try:
-            layer_result = self.update_layer_version(zip_content, region, mmdb_hash)
+            layer_result = self.update_layer_version(zip_content, region, city_hash, asn_hash)
             if layer_result['status'] != 'success':
                 return layer_result
 
@@ -776,27 +872,73 @@ class GeoIPUpdater:
                 self.cleanup_temp_files(after_update=False)
                 
                 try:
-                    # 下载数据库
-                    mmdb_path = self.download_mmdb()
-                    logging.info(f"成功下载数据库: {mmdb_path}")
-                    
+                    # 下载 City 数据库
+                    city_mmdb_path = self.download_mmdb()
+                    logging.info(f"City 数据库下载完成: {city_mmdb_path}")
+
+                    # 下载 ASN 数据库（可选）
+                    asn_mmdb_path = None
+                    asn_download_failed = False
+                    if self.asn_enabled:
+                        try:
+                            asn_mmdb_path = self.download_asn_mmdb()
+                            logging.info(f"ASN 数据库下载完成: {asn_mmdb_path}")
+                        except Exception as e:
+                            asn_download_failed = True
+                            logging.error(f"ASN 数据库下载失败: {str(e)}")
+
+                    # ASN 已启用但本次下载失败：跳过整体更新，避免误将已有 ASN
+                    # 从 Layer 中移除（下次周期重试）。仅在已存在含 ASN 的 Layer 时才需保护。
+                    if asn_download_failed:
+                        layer_info = self.get_layer_info(self.primary_region)
+                        existing_asn = False
+                        if layer_info:
+                            try:
+                                resp = self.execute_lambda_operation(
+                                    'get_layer_version', self.primary_region,
+                                    LayerName=self.layer_name,
+                                    VersionNumber=layer_info['version']
+                                )
+                                existing_asn = bool(self._extract_hash(resp.get('Description', ''), 'a'))
+                            except Exception as e:
+                                logging.warning(f"检查现有 ASN hash 失败: {str(e)}")
+                        if existing_asn:
+                            logging.warning(
+                                "ASN 下载失败且现有 Layer 含 ASN，跳过本次更新以避免移除 ASN，"
+                                "将在下次周期重试"
+                            )
+                            for p in [city_mmdb_path]:
+                                if p and os.path.exists(p):
+                                    os.unlink(p)
+                            self.cleanup_temp_files(after_update=True)
+                            return {region: {'status': 'skipped', 'reason': 'asn_download_failed'}
+                                    for region in self.regions}
+                        else:
+                            logging.warning("ASN 下载失败，现有 Layer 无 ASN，继续仅 City 更新")
+
                     # 检查是否需要更新
-                    if not force_update and not self.check_update_needed(mmdb_path, self.primary_region):
+                    if not force_update and not self.check_update_needed(
+                        city_mmdb_path, asn_mmdb_path, self.primary_region
+                    ):
                         logging.info("主区域无需更新，跳过所有区域")
                         results = {region: {'status': 'skipped', 'reason': 'no_update_needed'} 
                                 for region in self.regions}
                         self._log_update_results(results)
                         
                         # 清理下载的文件
-                        os.unlink(mmdb_path)
+                        for p in [city_mmdb_path, asn_mmdb_path]:
+                            if p and os.path.exists(p):
+                                os.unlink(p)
                         self.cleanup_temp_files(after_update=True)
                         return results
                     
                     # 执行更新
-                    results = self.update_all_regions(mmdb_path)
+                    results = self.update_all_regions(city_mmdb_path, asn_mmdb_path)
                     
                     # 清理临时文件
-                    os.unlink(mmdb_path)
+                    for p in [city_mmdb_path, asn_mmdb_path]:
+                        if p and os.path.exists(p):
+                            os.unlink(p)
                     self.cleanup_temp_files(after_update=True)
                     
                     return results
@@ -856,10 +998,28 @@ def main():
             updater.update_layer(force_update=args.force)
             
         elif args.action == 'check':
+            logging.info(f"ASN: {'启用' if updater.asn_enabled else '禁用'}, Hash比较模式: {updater.hash_compare_mode}")
             for region in updater.regions:
                 info = updater.get_layer_info(region)
                 if info:
                     logging.info(f"区域 {region}: 版本 {info['version']}, 更新时间 {info['created_date']}")
+                    # 显示 Description 中的 hash 信息
+                    try:
+                        response = updater.execute_lambda_operation(
+                            'get_layer_version', region,
+                            LayerName=updater.layer_name,
+                            VersionNumber=info['version']
+                        )
+                        desc = response.get('Description', '')
+                        city_h = updater._extract_hash(desc, 'c')
+                        asn_h = updater._extract_hash(desc, 'a')
+                        # 兼容旧格式
+                        if not city_h and 'mmdb_hash:' in desc:
+                            city_h = desc.split('mmdb_hash:')[1].split('|')[0].split()[0].strip()[:8]
+                        logging.info(f"  Description: {desc}")
+                        logging.info(f"  City hash: {city_h or 'N/A'}, ASN hash: {asn_h or 'N/A'}")
+                    except Exception as e:
+                        logging.warning(f"  获取详细信息失败: {str(e)}")
                 else:
                     logging.info(f"区域 {region}: 未找到Layer")
                     
