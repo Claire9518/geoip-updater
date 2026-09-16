@@ -22,7 +22,7 @@ version: '3'
 
 services:
   geoip-updater:
-    image: Claire9518/geoip-updater:latest
+    image: yourusername/geoip-updater:latest
     container_name: geoip-updater
     restart: unless-stopped
     env_file:
