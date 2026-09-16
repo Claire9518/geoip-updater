@@ -32,8 +32,23 @@ log_file = os.getenv('LOG_FILE', 'geoip_updater.log')
 if os.path.exists('/.dockerenv') and not os.path.isabs(log_file):
     log_file = os.path.join('/var/log', log_file)
 
-log_max_bytes = int(os.getenv('LOG_MAX_BYTES', str(10 * 1024 * 1024)))
-log_backup_count = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+def _parse_int_env(key, default):
+    """解析环境变量为整数，支持简单算术表达式（如 '10*1024*1024'）"""
+    raw = os.getenv(key, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            # 仅允许数字和算术运算符，防止代码注入
+            if all(c in '0123456789+-*/(). ' for c in raw):
+                return int(eval(raw))
+        except Exception:
+            pass
+        logging.warning(f"环境变量 {key}='{raw}' 不是有效整数，使用默认值 {default}")
+        return default
+
+log_max_bytes = _parse_int_env('LOG_MAX_BYTES', 10 * 1024 * 1024)
+log_backup_count = _parse_int_env('LOG_BACKUP_COUNT', 5)
 
 logging.basicConfig(
     level=logging.INFO,
